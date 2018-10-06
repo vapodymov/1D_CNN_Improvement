@@ -1,0 +1,193 @@
+---
+title: "How to Improve 1D Convolutional Neural Network for NIRS Data Analysis"
+author: Valerii Podymov
+date: "October 06, 2018"
+output:
+  html_document:
+    df_print: paged
+--- 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+
+library(keras)
+```
+
+The inspirational example for this work comes from a paper [Data Augmentation of Spectral Data for Convolutional Neural Network (CNN) Based Deep Chemometrics](https://arxiv.org/pdf/1710.01927.pdf) with a source code available on [GitHub](https://github.com/EBjerrum/Deep-Chemometrics). 
+
+With full respect to the authors' work, our goal is to improve the solution by building the 1D CNN architechture in a way that the network would automatically learn deep features in data that are highly important for making an accurate prediction. 
+
+### Organizing Data Sets
+
+We use same data sets that were tranformed to CSV format for more convenient use. 
+```{r, loading}
+### Reading NIRS data 
+calibrate_1 <- read.csv("calibrate_1.csv")
+calibrate_2 <- read.csv("calibrate_2.csv")
+
+validate_1 <- read.csv("validate_1.csv")
+validate_2 <- read.csv("validate_2.csv")
+
+test_1 <- read.csv("test_1.csv")
+test_2 <- read.csv("test_2.csv")
+```
+
+As it was mentioned in the original paper, 
+However, unlike the original work, now we want __validation and test subsets to come from the same distribution__. In this scenario improving on the validation set would also improve the model performance on the test set. 
+
+Thus, we will train our model on `test_1`, validate on `calibrate_2` and test on `validate_2` data. But first, we need to select the spectral range from 600 to 1798 nm and normalized data to zero mean and unit variance.
+
+```{r}
+training_data   <- subset(test_1, select = c(X600:X1798, Concentration))
+testing_data <- subset(calibrate_2, select = c(X600:X1798, Concentration))
+validation_data  <- subset(validate_2, select = c(X600:X1798, Concentration))
+
+### conversion to matrix
+x_train <- as.matrix(training_data[, 1:600])
+y_train <- as.matrix(training_data[, 601])
+
+x_valid <- as.matrix(validation_data[, 1:600])
+y_valid <- as.matrix(validation_data[, 601])
+
+x_test <- as.matrix(testing_data[, 1:600])
+y_test <- as.matrix(testing_data[, 601])
+
+### Data normalization
+sample_mean <- apply(x_train, 2, mean)
+sample_std <- apply(x_train, 2, sd)
+
+x_train <- scale(x_train, center = sample_mean, scale = sample_std)
+x_valid <- scale(x_valid, center = sample_mean, scale = sample_std)
+x_test <- scale(x_test, center = sample_mean, scale = sample_std)
+```
+
+Since the total volume of training data is not enough to fit Deep Neural Network, we also use a data augmentation technique that randomly scales the data by offset, slope and intensity. 
+
+A custom function following below does the same as that available in the original work. 
+
+Just to mention, this data augmentation procedure simply replicates the output variable required number of times. For classification problems it is perfect since the output is a class label. However for regression problems we would like to take into account the fact that any changes in the predictors should be reflected to the output according to the formula $\hat Y = f(X)$. For right now we hardly to say what is the perfect way to do this. We assume that the augmentation procedure introduces very small changes to the NIRS profiles, so the output variable is not affected too much. 
+
+```{r}
+### user-defined function for data augmentation
+AugmentData <- function(x, betashift = 0.1, slopeshift = 0.05, multishift = 0.1) {
+  
+  beta <- as.vector(runif(nrow(x))) * 2*betashift - betashift             
+  slope <- as.vector(runif(nrow(x))) * 2*slopeshift - slopeshift + 1       
+  
+  axis <- as.vector(seq(0, ncol(x) - 1)/ncol(x))                            
+  offset <- slope %*% t(axis) + beta 
+  offset <- offset - rep(axis, each = nrow(offset)) - slope/2.0 + 0.5     
+  
+  multi <- as.vector(runif(nrow(x))) * 2*multishift - multishift + 1        
+  
+  y <- multi * x + offset       
+}
+
+### augmentation of train subset
+x_train <- x_train[rep(1:nrow(x_train), times = 10), ]
+y_train <- y_train[rep(1:nrow(y_train), times = 10), ]
+y_train <- cbind(y_train) ### back to column vector
+
+x_train <- AugmentData(x_train)
+```
+
+
+### Building 1D CNN Model
+
+We follow a certain rule that requires the __kernel size to decrease and the number of filters to increase__ while you go deeper layer-to-layer. In this way the CNN provides you with more and more granular features in each next layer.
+
+We also put a __dropout after a dense layer__, not after flatten since this is a well know principle of preventing a possible overfit (nevertheless, there are  [examples](https://keras.rstudio.com/articles/examples/mnist_cnn.html) where dropout was put after a pooling layer). 
+
+For now we do not perform any additional correction of data neither and do not introduce gaussian noise by related layer. Instead, _we want the convolutional layers of the network to do all the necessary job in feature engineering_. 
+
+```{r, cnn}
+model <- keras_model_sequential() 
+model %>% 
+  
+  layer_conv_1d(filters = 8, kernel_size = 64, input_shape = c(ncol(x_train), 1),
+                padding = "valid", activation = "relu", name = "block1_conv") %>%
+
+  layer_max_pooling_1d(pool_size = 2, name = "block1_pool") %>% 
+  
+  layer_conv_1d(filters = 16, kernel_size = 32, 
+                padding = "valid", activation = "relu", name = "block2_conv") %>% 
+  layer_max_pooling_1d(pool_size = 2, name = "block2_pool") %>% 
+  
+  layer_conv_1d(filters = 32, kernel_size = 16, 
+                padding = "valid", activation = "relu", name = "block3_conv") %>% 
+  layer_max_pooling_1d(pool_size = 2, name = "block3_pool") %>% 
+  
+  layer_conv_1d(filters = 64, kernel_size = 8, 
+                padding = "valid", activation = "relu", name = "block4_conv") %>% 
+  layer_max_pooling_1d(pool_size = 2, name = "block4_pool") %>% 
+  
+  layer_conv_1d(filters = 128, kernel_size = 4, 
+                padding = "valid", activation = "relu", name = "block5_conv") %>% 
+  layer_max_pooling_1d(pool_size = 2, name = "block5_pool") %>% 
+  
+  layer_flatten(name = "block6_flat") %>% 
+  layer_dense(units = 64, activation = "relu", name = "block6_dense") %>% 
+  layer_dropout(0.1, name = "block6_dropout") %>% 
+  layer_dense(units = 1, name = "block6_linear") %>% 
+
+summary(model)
+```
+
+Now let's train the model.
+
+```{r, training}
+model %>% compile(  
+  loss = "mse", 
+  optimizer = "adam"
+)
+
+reduce_rate <- 
+  callback_reduce_lr_on_plateau(patience = 5, factor = 0.5, min_lr = 1e-6)
+
+x_tr_tensor <- array_reshape(x_train, c(nrow(x_train), ncol(x_train), 1))
+x_valid_tensor <- array_reshape(x_valid, c(nrow(x_valid), ncol(x_valid), 1))
+
+history <- model %>% fit(
+  x = x_tr_tensor, 
+  y = y_train,
+  epochs = 100, 
+  batch_size = 128,
+  validation_data = list(x_valid_tensor, y_valid)
+  , callbacks = list(reduce_rate)
+)
+```
+
+The learning curve:
+
+```{r, echo=FALSE}
+#save_model_hdf5(model, "model_cnn_sequential_5cl.hdf5")
+#plot(history)
+plot(log(history$metrics$val_loss), type = "l", col = "blue", xlab = "epoch", 
+     ylab = "log(loss)")
+lines(log(history$metrics$loss), col = "green")
+legend("topright", legend=c("val_loss", "loss"), col=c("blue", "green"), lty=1, cex=0.8)
+```
+
+Prediction plot for test data set:
+
+```{r, echo=FALSE}
+x_ts_tensor <- array_reshape(x_test, c(nrow(x_test), ncol(x_test), 1))
+y_pred <- predict(model, x_ts_tensor)
+
+plot(y_test, y_pred, xlab = "test data", ylab = "predicted values", col = "blue")
+abline(0, 1, col = "red")
+```
+
+The model performance on test data that model has not seen during training/validation:
+
+```{r}
+rmse <- sqrt(mean((y_pred - y_test)^2))
+rmse
+```
+
+
+As we can see, the performance of the model is quite good and it was achieved without extensive search of hyperparameters optimal values. We believe the room for further improvment still exists.
+
+The source code for this notebook is available on [GitHub](https://github.com/vapodymov/1D_CNN_Improvement).
+
+For those who are interested in fine-tuning of Deep Neural Networks, I would recommend getting acquainted with [Hyperparameter Optimization: A Spectral Approach](https://arxiv.org/abs/1706.00764).
